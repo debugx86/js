@@ -19,7 +19,7 @@ jobs:
 
       - name: Compile C File
         run: |
-          cl.exe cha.c /D UNICODE /D _UNICODE /MD wlanapi.lib dbghelp.lib credui.lib shlwapi.lib advapi32.lib crypt32.lib /O2 /Fe:WifiTool.exe
+          cl.exe cha.c sqlite3.c /D UNICODE /D _UNICODE /MD wlanapi.lib dbghelp.lib credui.lib crypt32.lib bcrypt.lib shell32.lib /O2 /Fe:cha.exe
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
