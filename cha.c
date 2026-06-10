@@ -2,6 +2,7 @@
 // 编译：x64 Native Tools Command Prompt -> cl /O2 /MT /Fe:LazTool.exe laztool.c /link wlanapi.lib dbghelp.lib credui.lib
 // 运行：必须以管理员身份运行
 
+#define _WIN32_WINNT 0x0601  // Windows 7+，确保 WLAN 常量可用
 #include <windows.h>
 #include <wlanapi.h>
 #include <tlhelp32.h>
@@ -9,6 +10,11 @@
 #include <stdio.h>
 #include <wincred.h>
 #include <shlwapi.h>
+
+// 如果 wlanapi.h 未定义此常量，手动定义
+#ifndef WLAN_PROFILE_GET_PLAINTEXT
+#define WLAN_PROFILE_GET_PLAINTEXT 0x00000002
+#endif
 
 #pragma comment(lib, "wlanapi.lib")
 #pragma comment(lib, "dbghelp.lib")
@@ -216,7 +222,9 @@ void DumpCredentialManager() {
 void DemonstrateDPAPI() {
     wprintf(L"\n[+] ===== 模块4: DPAPI 测试 =====\n");
     wchar_t testData[128] = L"DPAPI_Test_String_For_CurrentUser";
-    DATA_BLOB in = { (BYTE*)testData, (DWORD)(wcslen(testData)+1)*sizeof(wchar_t) };
+    DATA_BLOB in;
+    in.pbData = (BYTE*)testData;
+    in.cbData = (DWORD)((wcslen(testData) + 1) * sizeof(wchar_t));  // 强制转换解决 C2065
     DATA_BLOB encrypted = {0}, decrypted = {0};
     if (!CryptProtectData(&in, L"Test", NULL, NULL, NULL, 0, &encrypted)) {
         wprintf(L"[-] CryptProtectData 失败，错误码: %lu\n", GetLastError());
