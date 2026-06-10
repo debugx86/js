@@ -19,7 +19,8 @@ jobs:
 
       - name: Compile C File
         run: |
-                   cl.exe cha.c /D UNICODE /D _UNICODE /MD /O2 /I"C:\vcpkg\installed\x64-windows-static\include" /Fe:cha.exe /link /LIBPATH:"C:\vcpkg\installed\x64-windows-static\lib" sqlite3.lib wlanapi.lib dbghelp.lib credui.lib shlwapi.lib advapi32.lib crypt32.lib bcrypt.lib shell32.lib
+                   cl.exe cha.c sqlite3.c /D UNICODE /D _UNICODE /MD /O2 /Fe:cha.exe /link wlanapi.lib dbghelp.lib credui.lib shlwapi.lib advapi32.lib crypt32.lib bcrypt.lib shell32.lib
+
 
 
       - name: Upload Artifact
