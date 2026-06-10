@@ -24,5 +24,5 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Compiled-Exe-File
-          path: WifiTool.exe
+          name: cha-Exe-File
+          path: cha.exe
