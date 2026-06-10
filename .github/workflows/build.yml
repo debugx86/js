@@ -1,0 +1,31 @@
+name: MSVC Build Project
+
+on:
+  push:
+    branches: [ "main" ] # 當你提交代碼到 main 分支時觸發
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:      # 允許你在後台手動點擊按鈕觸發編譯
+
+jobs:
+  build:
+    runs-on: windows-2022 # 使用內建 Visual Studio 2022 的 Windows 雲端環境
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Compile C File with MSVC
+      run: |
+        # 使用 cl.exe 編譯器，/D UNICODE 和 /D _UNICODE 啟用 Unicode 字元集
+        # /MD 使用多執行緒 DLL，並直接連結你指定的四個 .lib 庫檔案
+        cl.exe cha.c /D UNICODE /D _UNICODE /MD wlanapi.lib dbghelp.lib credui.lib shlwapi.lib /O2 /Fe:WifiTool.exe
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Compiled-Exe-File
+        path: WifiTool.exe # 這是編譯出來的檔案名稱，會打包成 zip 供你下載
