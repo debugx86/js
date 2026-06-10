@@ -1,5 +1,8 @@
 #include <windows.h>
 #include <wlanapi.h>
+#ifndef WLAN_PROFILE_GET_PLAINTEXT
+#define WLAN_PROFILE_GET_PLAINTEXT 0x00000001
+#endif
 #include <tlhelp32.h>
 #include <dbghelp.h>
 #include <stdio.h>
