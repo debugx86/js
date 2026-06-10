@@ -13,8 +13,9 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Add MSBuild to PATH
-        uses: microsoft/setup-msbuild@v2
+      # 關鍵步驟：載入 Visual Studio 的 cl.exe 編譯環境
+      - name: Initialize MSVC Environment
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Compile C File
         run: |
