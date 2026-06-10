@@ -213,22 +213,44 @@ void DumpCredentialManager() {
 // ------------------- 模块4: DPAPI Demo -------------------
 void DemonstrateDPAPI() {
     printf("\n[+] ===== DPAPI Test =====\n");
+    
     wchar_t test[] = L"DPAPI_Test_Data_For_CurrentUser";
-    DATA_BLOB in = { (BYTE*)test, (DWORD)((wcslen(test)+1)*sizeof(wchar_t)) };
-    DATA_BLOB enc = {0}, dec = {0};
-    if (!CryptProtectData(&in, L"Test", NULL, NULL, NULL, 0, &enc)) {
-        printf("[-] CryptProtectData failed: %lu\n", GetLastError());
+    DWORD dataSize = (DWORD)((wcslen(test) + 1) * sizeof(wchar_t));
+
+    // 💡 修正關鍵：使用 LocalAlloc 在堆疊 (Heap) 上申請一塊標準對齊的記憶體
+    BYTE* secureBuffer = (BYTE*)LocalAlloc(LPTR, dataSize);
+    if (!secureBuffer) {
+        printf("[-] LocalAlloc failed\n");
         return;
     }
+    // 將資料複製過去，此時 secureBuffer 的指標位址 100% 安全合規
+    RtlCopyMemory(secureBuffer, test, dataSize);
+
+    DATA_BLOB in = { secureBuffer, dataSize };
+    DATA_BLOB enc = {0}, dec = {0};
+
+    // 傳入標準對齊的 heap 指標
+    if (!CryptProtectData(&in, L"Test", NULL, NULL, NULL, 0, &enc)) {
+        printf("[-] CryptProtectData failed: %lu\n", GetLastError());
+        LocalFree(secureBuffer);
+        return;
+    }
+
     if (!CryptUnprotectData(&enc, NULL, NULL, NULL, NULL, 0, &dec)) {
         printf("[-] CryptUnprotectData failed: %lu\n", GetLastError());
+        LocalFree(secureBuffer);
         LocalFree(enc.pbData);
         return;
     }
+
     printf("[+] DPAPI works. Decrypted: %S\n", (wchar_t*)dec.pbData);
+
+    // 釋放所有配置的記憶體
+    LocalFree(secureBuffer);
     LocalFree(enc.pbData);
     LocalFree(dec.pbData);
 }
+
 
 // ------------------- 模块5: Chromium 密码 -------------------
 // 函数声明已在前面，这里给出实现
@@ -458,6 +480,3 @@ BOOL AesGcmDecrypt(const BYTE* key, DWORD keyLen, const BYTE* iv, DWORD ivLen, c
     }
     return FALSE;
 }
-
-
-
