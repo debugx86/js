@@ -13,13 +13,13 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 關鍵步驟：載入 Visual Studio 的 cl.exe 編譯環境
+      # 載入 Visual Studio 的 cl.exe 編譯環境
       - name: Initialize MSVC Environment
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Compile C File
         run: |
-          cl.exe cha.c /D UNICODE /D _UNICODE /MD wlanapi.lib dbghelp.lib credui.lib shlwapi.lib /O2 /Fe:WifiTool.exe
+          cl.exe cha.c /D UNICODE /D _UNICODE /MD wlanapi.lib dbghelp.lib credui.lib shlwapi.lib advapi32.lib crypt32.lib /O2 /Fe:WifiTool.exe
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
