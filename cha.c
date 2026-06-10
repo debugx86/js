@@ -22,6 +22,9 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")  // 補上這一行（負責進程 Token 與登錄檔 API）
+#pragma comment(lib, "user32.lib")    // 建議順便補上這一行防禦
+
 
 #ifndef WLAN_PROFILE_GET_PLAINTEXT
 #define WLAN_PROFILE_GET_PLAINTEXT 0x00000002
