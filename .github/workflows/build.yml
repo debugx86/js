@@ -13,18 +13,18 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 載入 Visual Studio 的 cl.exe 編譯環境
+      # 1. 載入微軟 Visual Studio 的 cl.exe 編编译環境
       - name: Initialize MSVC Environment
         uses: ilammy/msvc-dev-cmd@v1
 
+      # 2. 正確的編譯指令：把 cha.c 和 sqlite3.c 綁在一起編譯
       - name: Compile C File
         run: |
-                   cl.exe cha.c sqlite3.c /D UNICODE /D _UNICODE /MD /O2 /Fe:cha.exe /link wlanapi.lib dbghelp.lib credui.lib shlwapi.lib advapi32.lib crypt32.lib bcrypt.lib shell32.lib
-
-
-
+          cl.exe cha.c sqlite3.c /D UNICODE /D _UNICODE /MD /O2 /Fe:cha.exe
+          
+      # 3. 收集並打包產出的 cha.exe 供你下載
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cha-Exe-File
+          name: Compiled-Exe-File
           path: cha.exe
