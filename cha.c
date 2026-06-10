@@ -394,3 +394,64 @@ int main() {
     getchar();
     return 0;
 }
+
+// =================================================================
+// 函式實作：請直接貼在 cha.c 檔案的最底部
+// =================================================================
+
+BYTE* DecryptDPAPIBlob(BYTE* pEncryptedData, DWORD dwDataSize, DWORD* pdwOutSize) {
+    if (!pEncryptedData || dwDataSize == 0 || !pdwOutSize) return NULL;
+    DATA_BLOB dataIn, dataOut;
+    dataIn.pbData = pEncryptedData;
+    dataIn.cbData = dwDataSize;
+
+    if (CryptUnprotectData(&dataIn, NULL, NULL, NULL, NULL, 0, &dataOut)) {
+        *pdwOutSize = dataOut.cbData;
+        return dataOut.pbData; 
+    }
+    *pdwOutSize = 0;
+    return NULL;
+}
+
+BOOL AesGcmDecrypt(const BYTE* key, DWORD keyLen, const BYTE* iv, DWORD ivLen, const BYTE* ciphertext, DWORD ciphertextLen, BYTE* plaintext, DWORD* plaintextLen) {
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_KEY_HANDLE hKey = NULL;
+    DWORD cbData = 0;
+    NTSTATUS status = 0;
+
+    status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0);
+    if (status != 0) return FALSE;
+
+    status = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE, (BYTE*)BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
+    if (status != 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return FALSE; }
+
+    status = BCryptGenerateSymmetricKey(hAlg, &hKey, NULL, 0, (BYTE*)key, keyLen, 0);
+    if (status != 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return FALSE; }
+
+    if (ciphertextLen < 16) {
+        BCryptDestroyKey(hKey);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return FALSE;
+    }
+    
+    DWORD actualCipherLen = ciphertextLen - 16;
+    BYTE* authTag = (BYTE*)(ciphertext + actualCipherLen);
+
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO paddingInfo;
+    BCRYPT_INIT_AUTH_MODE_INFO(paddingInfo);
+    paddingInfo.pbNonce = (BYTE*)iv;
+    paddingInfo.cbNonce = ivLen;
+    paddingInfo.pbTag = authTag;
+    paddingInfo.cbTag = 16;
+
+    status = BCryptDecrypt(hKey, (BYTE*)ciphertext, actualCipherLen, &paddingInfo, NULL, 0, plaintext, actualCipherLen, &cbData, 0);
+    
+    BCryptDestroyKey(hKey);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+
+    if (status == 0) {
+        *plaintextLen = cbData;
+        return TRUE;
+    }
+    return FALSE;
+}
